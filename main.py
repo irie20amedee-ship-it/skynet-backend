@@ -15,6 +15,8 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 JWT_SECRET    = os.getenv("JWT_SECRET", "skynet-secret-change-me")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
+print(f"STARTUP: ANTHROPIC_KEY présent = {bool(ANTHROPIC_KEY)}, longueur = {len(ANTHROPIC_KEY)}", flush=True)
+
 # ── BASE DE DONNÉES ────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect("skynet.db", check_same_thread=False)
@@ -109,13 +111,13 @@ def analyze_video(body: AnalyzeBody, user=Depends(get_current_user)):
         (video_id, user["id"], body.url, "processing", None, datetime.utcnow().isoformat()))
     db.commit()
     db.close()
-    # Analyse en arrière-plan
     import threading
     threading.Thread(target=run_analysis, args=(video_id, body, user["id"])).start()
     return {"video_id": video_id, "status": "processing"}
 
 def run_analysis(video_id, body, user_id):
     try:
+        print(f"ANALYSE START: video_id={video_id}, url={body.url}", flush=True)
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         prompt = f"""Tu es SKYnet, expert en contenu viral.
 Niche: {body.niche}
@@ -126,15 +128,18 @@ Plateformes: {', '.join(body.platforms)}
 Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour):
 {{"clips":[{{"rank":1,"title":"...","hook_type":"Révélation","ts_start":"03:42","ts_end":"04:28","viral_score":94,"viral_tier":"high","retention_score":91,"description":"...","caption":"... #hashtag","hashtags":"#tag1 #tag2 #tag3","platforms":{body.platforms}}}]}}"""
 
+        print(f"ANALYSE: Appel Claude API...", flush=True)
         message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+            model="claude-3-5-haiku-20241022",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
+        print(f"ANALYSE: Réponse Claude reçue", flush=True)
         raw = message.content[0].text
         cleaned = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(cleaned)
         clips = parsed.get("clips", [])
+        print(f"ANALYSE SUCCESS: {len(clips)} clips générés", flush=True)
 
         db = get_db()
         db.execute("UPDATE videos SET status='analyzed', clips_json=? WHERE id=?",
@@ -144,6 +149,7 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
         db.commit()
         db.close()
     except Exception as e:
+        print(f"ANALYSE ERROR: {type(e).__name__}: {e}", flush=True)
         db = get_db()
         db.execute("UPDATE videos SET status='failed' WHERE id=?", (video_id,))
         db.commit()
