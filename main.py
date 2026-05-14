@@ -127,7 +127,7 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
 {{"clips":[{{"rank":1,"title":"...","hook_type":"Révélation","ts_start":"03:42","ts_end":"04:28","viral_score":94,"viral_tier":"high","retention_score":91,"description":"...","caption":"... #hashtag","hashtags":"#tag1 #tag2 #tag3","platforms":{body.platforms}}}]}}"""
 
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
