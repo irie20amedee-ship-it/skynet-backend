@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import FileResponse
@@ -59,7 +59,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Token invalide")
 
 def ts_to_seconds(ts):
-    """Convertit MM:SS ou HH:MM:SS en secondes"""
     parts = ts.strip().split(":")
     if len(parts) == 2:
         return int(parts[0]) * 60 + int(parts[1])
@@ -128,10 +127,7 @@ def analyze_video(body: AnalyzeBody, user=Depends(get_current_user)):
     return {"video_id": video_id, "status": "processing"}
 
 def run_analysis(video_id, body, user_id):
-    video_dir = f"{CLIPS_DIR}/{video_id}"
-    os.makedirs(video_dir, exist_ok=True)
     try:
-        # Étape 1 : Claude génère les timestamps
         print(f"ANALYSE START: video_id={video_id}", flush=True)
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         prompt = f"""Tu es SKYnet, expert en contenu viral.
@@ -152,35 +148,66 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
         cleaned = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(cleaned)
         clips = parsed.get("clips", [])
-        print(f"ANALYSE: {len(clips)} clips générés par Claude", flush=True)
+        print(f"ANALYSE SUCCESS: {len(clips)} clips générés", flush=True)
 
-        # Étape 2 : Téléchargement de la vidéo YouTube
-        print(f"DOWNLOAD: Téléchargement de {body.url}", flush=True)
-        video_path = f"{video_dir}/full_video.mp4"
-        import yt_dlp
-        ydl_opts = {
-            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best',
-            'outtmpl': video_path,
-            'quiet': True,
-            'no_warnings': True,
-            'extractor_retries': 3,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([body.url])
-        print(f"DOWNLOAD: Vidéo téléchargée", flush=True)
+        db = get_db()
+        db.execute("UPDATE videos SET status='analyzed', clips_json=? WHERE id=?",
+            (json.dumps(clips), video_id))
+        db.execute("UPDATE users SET clips_used=clips_used+? WHERE id=?",
+            (len(clips), user_id))
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"ANALYSE ERROR: {type(e).__name__}: {e}", flush=True)
+        db = get_db()
+        db.execute("UPDATE videos SET status='failed' WHERE id=?", (video_id,))
+        db.commit()
+        db.close()
 
-        # Étape 3 : Découpe des clips avec ffmpeg
+# ── UPLOAD ET DÉCOUPE ─────────────────────────────────────
+@app.post("/api/videos/{video_id}/upload")
+async def upload_video(video_id: str, file: UploadFile = File(...), user=Depends(get_current_user)):
+    db = get_db()
+    video = db.execute("SELECT * FROM videos WHERE id=? AND user_id=?",
+        (video_id, user["id"])).fetchone()
+    db.close()
+    if not video:
+        raise HTTPException(status_code=404, detail="Vidéo introuvable")
+    video = dict(video)
+    if not video["clips_json"]:
+        raise HTTPException(status_code=400, detail="Analyse pas encore terminée")
+
+    video_dir = f"{CLIPS_DIR}/{video_id}"
+    os.makedirs(video_dir, exist_ok=True)
+
+    ext = os.path.splitext(file.filename)[1] or ".mp4"
+    video_path = f"{video_dir}/source{ext}"
+
+    with open(video_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    print(f"UPLOAD: Fichier reçu {file.filename} ({len(content)} bytes)", flush=True)
+
+    import threading
+    threading.Thread(target=cut_clips, args=(video_id, video_path, video["clips_json"])).start()
+
+    return {"status": "cutting", "message": "Découpe en cours..."}
+
+def cut_clips(video_id, video_path, clips_json):
+    try:
+        clips = json.loads(clips_json)
+        video_dir = f"{CLIPS_DIR}/{video_id}"
+
         for i, clip in enumerate(clips):
             ts_start = clip.get("ts_start", "00:00")
             ts_end = clip.get("ts_end", "00:30")
             start_sec = ts_to_seconds(ts_start)
             end_sec = ts_to_seconds(ts_end)
-            duration = end_sec - start_sec
-            if duration <= 0:
-                duration = body.target_duration
+            duration = max(end_sec - start_sec, 5)
 
             clip_path = f"{video_dir}/clip_{i+1}.mp4"
-            print(f"CUT: Clip {i+1} de {ts_start} à {ts_end}", flush=True)
+            print(f"CUT: Clip {i+1} de {ts_start} à {ts_end} ({duration}s)", flush=True)
+
             result = subprocess.run([
                 "ffmpeg", "-i", video_path,
                 "-ss", str(start_sec),
@@ -191,34 +218,26 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
             ], capture_output=True, text=True)
 
             if result.returncode == 0:
-                clip["clip_file"] = f"/api/clips/{video_id}/{i+1}"
+                clips[i]["clip_ready"] = True
                 print(f"CUT: Clip {i+1} OK", flush=True)
             else:
-                print(f"CUT ERROR clip {i+1}: {result.stderr[-200:]}", flush=True)
-
-        # Supprimer la vidéo complète pour libérer de l'espace
-        if os.path.exists(video_path):
-            os.remove(video_path)
+                print(f"CUT ERROR clip {i+1}: {result.stderr[-300:]}", flush=True)
 
         db = get_db()
-        db.execute("UPDATE videos SET status='analyzed', clips_json=? WHERE id=?",
+        db.execute("UPDATE videos SET status='clips_ready', clips_json=? WHERE id=?",
             (json.dumps(clips), video_id))
-        db.execute("UPDATE users SET clips_used=clips_used+? WHERE id=?",
-            (len(clips), user_id))
         db.commit()
         db.close()
-        print(f"ANALYSE SUCCESS: {len(clips)} clips prêts", flush=True)
+        print(f"CUT SUCCESS: tous les clips prêts", flush=True)
 
     except Exception as e:
-        print(f"ANALYSE ERROR: {type(e).__name__}: {e}", flush=True)
-        if os.path.exists(video_dir):
-            shutil.rmtree(video_dir, ignore_errors=True)
+        print(f"CUT ERROR: {type(e).__name__}: {e}", flush=True)
         db = get_db()
-        db.execute("UPDATE videos SET status='failed' WHERE id=?", (video_id,))
+        db.execute("UPDATE videos SET status='analyzed' WHERE id=?", (video_id,))
         db.commit()
         db.close()
 
-# ── DOWNLOAD CLIPS ────────────────────────────────────────
+# ── DOWNLOAD CLIP ─────────────────────────────────────────
 @app.get("/api/clips/{video_id}/{clip_index}")
 def download_clip(video_id: str, clip_index: int, user=Depends(get_current_user)):
     clip_path = f"{CLIPS_DIR}/{video_id}/clip_{clip_index}.mp4"
@@ -252,4 +271,4 @@ def analytics(user=Depends(get_current_user)):
 
 @app.get("/")
 def root():
-    return {"status": "SKYnet API en ligne", "version": "2.0"}
+    return {"status": "SKYnet API en ligne", "version": "3.0"}
