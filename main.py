@@ -243,7 +243,7 @@ def cut_clips(video_id, video_path, clips_json):
 
 # ── DOWNLOAD CLIP ─────────────────────────────────────────
 @app.get("/api/clips/{video_id}/{clip_index}")
-def download_clip(video_id: str, clip_index: int, user=Depends(get_current_user)):
+def download_clip(video_id: str, clip_index: int):
     clip_path = f"{CLIPS_DIR}/{video_id}/clip_{clip_index}.mp4"
     if not os.path.exists(clip_path):
         raise HTTPException(status_code=404, detail="Clip non trouvé ou expiré")
