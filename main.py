@@ -20,6 +20,30 @@ os.makedirs(CLIPS_DIR, exist_ok=True)
 
 print(f"STARTUP: ANTHROPIC_KEY présent = {bool(ANTHROPIC_KEY)}, longueur = {len(ANTHROPIC_KEY)}", flush=True)
 
+# Diagnostic faster-whisper au démarrage
+try:
+    from faster_whisper import WhisperModel
+    print("STARTUP: faster-whisper OK", flush=True)
+except Exception as e:
+    print(f"STARTUP: faster-whisper ERREUR: {e}", flush=True)
+
+# Cherche le meilleur ffmpeg disponible (système = nixpkgs avec libass, sinon imageio)
+def get_ffmpeg():
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        print(f"FFMPEG: système trouvé à {sys_ffmpeg}", flush=True)
+        return sys_ffmpeg
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        print(f"FFMPEG: imageio trouvé à {path}", flush=True)
+        return path
+    except Exception as e:
+        print(f"FFMPEG: introuvable! {e}", flush=True)
+        return "ffmpeg"
+
+FFMPEG_EXE = get_ffmpeg()
+
 # ── BASE DE DONNÉES ────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect("skynet.db", check_same_thread=False)
@@ -165,15 +189,12 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
         db.close()
 
 # ── SOUS-TITRES STYLE TIKTOK ──────────────────────────────
-def add_subtitles(ffmpeg_exe, clip_path):
-    """Transcrit l'audio et brûle des sous-titres style TikTok dans le clip."""
+def add_subtitles(clip_path):
     try:
         from faster_whisper import WhisperModel
 
-        print(f"SUBTITLE: Chargement du modèle Whisper...", flush=True)
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-
         print(f"SUBTITLE: Transcription de {clip_path}", flush=True)
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
         segments, _ = model.transcribe(clip_path, word_timestamps=True)
 
         all_words = []
@@ -182,60 +203,64 @@ def add_subtitles(ffmpeg_exe, clip_path):
                 all_words.extend(seg.words)
 
         if not all_words:
-            print("SUBTITLE: Aucun mot détecté, clip gardé sans sous-titres", flush=True)
+            print("SUBTITLE: Aucun mot détecté", flush=True)
             return
 
-        # Génère le fichier ASS avec style TikTok
-        ass_header = """\
-[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 0
+        print(f"SUBTITLE: {len(all_words)} mots transcrits", flush=True)
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TikTok,Arial Black,88,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,5,2,2,20,20,150,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-        def t2ass(t):
+        # Génère le fichier SRT (ne nécessite pas libass, supporté nativement)
+        def t2srt(t):
             h = int(t // 3600)
             m = int((t % 3600) // 60)
-            s = t % 60
-            return f"{h}:{m:02d}:{s:05.2f}"
+            s = int(t % 60)
+            ms = int((t % 1) * 1000)
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-        lines = []
+        srt_lines = []
+        idx = 1
         for i in range(0, len(all_words), 3):
             chunk = all_words[i:i+3]
             start = chunk[0].start
             end = chunk[-1].end
             text = " ".join(w.word.strip() for w in chunk).upper()
-            lines.append(f"Dialogue: 0,{t2ass(start)},{t2ass(end)},TikTok,,0,0,0,,{text}")
+            srt_lines.append(f"{idx}\n{t2srt(start)} --> {t2srt(end)}\n{text}\n")
+            idx += 1
 
-        ass_content = ass_header + "\n".join(lines) + "\n"
-
-        fd, ass_path = tempfile.mkstemp(suffix=".ass")
+        srt_content = "\n".join(srt_lines)
+        fd, srt_path = tempfile.mkstemp(suffix=".srt")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(ass_content)
+            f.write(srt_content)
 
         tmp_out = clip_path.replace(".mp4", "_sub.mp4")
+
+        # Style TikTok via force_style: gros, blanc, contour noir, centré en bas
+        style = (
+            "Fontname=DejaVu Sans Bold,"
+            "Fontsize=24,"
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "BorderStyle=1,"
+            "Outline=3,"
+            "Bold=1,"
+            "Alignment=2,"
+            "MarginV=60"
+        )
+
         result = subprocess.run([
-            ffmpeg_exe, "-i", clip_path,
-            "-vf", f"ass={ass_path}",
+            FFMPEG_EXE, "-i", clip_path,
+            "-vf", f"subtitles={srt_path}:force_style='{style}'",
             "-c:a", "copy",
             "-preset", "fast",
             "-y", tmp_out
         ], capture_output=True, text=True)
 
-        os.unlink(ass_path)
+        os.unlink(srt_path)
 
         if result.returncode == 0 and os.path.exists(tmp_out):
             os.replace(tmp_out, clip_path)
-            print(f"SUBTITLE: OK — sous-titres ajoutés", flush=True)
+            print(f"SUBTITLE: OK — sous-titres brûlés dans le clip", flush=True)
         else:
-            print(f"SUBTITLE ERROR ffmpeg: {result.stderr[-300:]}", flush=True)
+            print(f"SUBTITLE ERROR ffmpeg (code {result.returncode}): {result.stderr[-500:]}", flush=True)
             if os.path.exists(tmp_out):
                 os.unlink(tmp_out)
 
@@ -273,10 +298,7 @@ async def upload_video(video_id: str, file: UploadFile = File(...), user=Depends
 
 def cut_clips(video_id, video_path, clips_json):
     try:
-        import imageio_ffmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        print(f"CUT: ffmpeg trouvé à {ffmpeg_exe}", flush=True)
-
+        print(f"CUT: ffmpeg = {FFMPEG_EXE}", flush=True)
         clips = json.loads(clips_json)
         video_dir = f"{CLIPS_DIR}/{video_id}"
 
@@ -291,7 +313,7 @@ def cut_clips(video_id, video_path, clips_json):
             print(f"CUT: Clip {i+1} de {ts_start} à {ts_end} ({duration}s)", flush=True)
 
             result = subprocess.run([
-                ffmpeg_exe, "-i", video_path,
+                FFMPEG_EXE, "-i", video_path,
                 "-ss", str(start_sec),
                 "-t", str(duration),
                 "-c:v", "libx264", "-c:a", "aac",
@@ -301,8 +323,8 @@ def cut_clips(video_id, video_path, clips_json):
 
             if result.returncode == 0:
                 clips[i]["clip_ready"] = True
-                print(f"CUT: Clip {i+1} OK — ajout des sous-titres...", flush=True)
-                add_subtitles(ffmpeg_exe, clip_path)
+                print(f"CUT: Clip {i+1} OK — lancement sous-titres", flush=True)
+                add_subtitles(clip_path)
             else:
                 print(f"CUT ERROR clip {i+1}: {result.stderr[-300:]}", flush=True)
 
@@ -354,4 +376,4 @@ def analytics(user=Depends(get_current_user)):
 
 @app.get("/")
 def root():
-    return {"status": "SKYnet API en ligne", "version": "4.0"}
+    return {"status": "SKYnet API en ligne", "version": "5.0"}
