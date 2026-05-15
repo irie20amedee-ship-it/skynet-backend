@@ -195,6 +195,10 @@ async def upload_video(video_id: str, file: UploadFile = File(...), user=Depends
 
 def cut_clips(video_id, video_path, clips_json):
     try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        print(f"CUT: ffmpeg trouvé à {ffmpeg_exe}", flush=True)
+
         clips = json.loads(clips_json)
         video_dir = f"{CLIPS_DIR}/{video_id}"
 
@@ -209,7 +213,7 @@ def cut_clips(video_id, video_path, clips_json):
             print(f"CUT: Clip {i+1} de {ts_start} à {ts_end} ({duration}s)", flush=True)
 
             result = subprocess.run([
-                "ffmpeg", "-i", video_path,
+                ffmpeg_exe, "-i", video_path,
                 "-ss", str(start_sec),
                 "-t", str(duration),
                 "-c:v", "libx264", "-c:a", "aac",
