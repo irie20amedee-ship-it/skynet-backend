@@ -4,3 +4,4 @@ anthropic>=0.40.0
 pyjwt==2.8.0
 python-multipart==0.0.9
 pydantic[email]==2.11.0
+yt-dlp>=2024.1.0
