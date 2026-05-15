@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from typing import Optional, List
-import anthropic, os, uuid, json
+import anthropic, os, uuid, json, subprocess, shutil
 from datetime import datetime, timedelta
 import jwt, sqlite3, hashlib
 
@@ -14,6 +15,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 JWT_SECRET    = os.getenv("JWT_SECRET", "skynet-secret-change-me")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+CLIPS_DIR     = "/tmp/skynet_clips"
+os.makedirs(CLIPS_DIR, exist_ok=True)
 
 print(f"STARTUP: ANTHROPIC_KEY présent = {bool(ANTHROPIC_KEY)}, longueur = {len(ANTHROPIC_KEY)}", flush=True)
 
@@ -54,6 +57,15 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         return dict(user)
     except:
         raise HTTPException(status_code=401, detail="Token invalide")
+
+def ts_to_seconds(ts):
+    """Convertit MM:SS ou HH:MM:SS en secondes"""
+    parts = ts.strip().split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    elif len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    return 0
 
 # ── AUTH ───────────────────────────────────────────────────
 class RegisterBody(BaseModel):
@@ -116,8 +128,11 @@ def analyze_video(body: AnalyzeBody, user=Depends(get_current_user)):
     return {"video_id": video_id, "status": "processing"}
 
 def run_analysis(video_id, body, user_id):
+    video_dir = f"{CLIPS_DIR}/{video_id}"
+    os.makedirs(video_dir, exist_ok=True)
     try:
-        print(f"ANALYSE START: video_id={video_id}, url={body.url}", flush=True)
+        # Étape 1 : Claude génère les timestamps
+        print(f"ANALYSE START: video_id={video_id}", flush=True)
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         prompt = f"""Tu es SKYnet, expert en contenu viral.
 Niche: {body.niche}
@@ -126,20 +141,64 @@ Durée clips: {body.target_duration}s
 Plateformes: {', '.join(body.platforms)}
 
 Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour):
-{{"clips":[{{"rank":1,"title":"...","hook_type":"Révélation","ts_start":"03:42","ts_end":"04:28","viral_score":94,"viral_tier":"high","retention_score":91,"description":"...","caption":"... #hashtag","hashtags":"#tag1 #tag2 #tag3","platforms":{body.platforms}}}]}}"""
+{{"clips":[{{"rank":1,"title":"...","hook_type":"Révélation","ts_start":"03:42","ts_end":"04:28","viral_score":94,"viral_tier":"high","retention_score":91,"description":"...","caption":"... #hashtag","hashtags":"#tag1 #tag2 #tag3"}}]}}"""
 
-        print(f"ANALYSE: Appel Claude API...", flush=True)
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
-        print(f"ANALYSE: Réponse Claude reçue", flush=True)
         raw = message.content[0].text
         cleaned = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(cleaned)
         clips = parsed.get("clips", [])
-        print(f"ANALYSE SUCCESS: {len(clips)} clips générés", flush=True)
+        print(f"ANALYSE: {len(clips)} clips générés par Claude", flush=True)
+
+        # Étape 2 : Téléchargement de la vidéo YouTube
+        print(f"DOWNLOAD: Téléchargement de {body.url}", flush=True)
+        video_path = f"{video_dir}/full_video.mp4"
+        import yt_dlp
+        ydl_opts = {
+            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best',
+            'outtmpl': video_path,
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_retries': 3,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([body.url])
+        print(f"DOWNLOAD: Vidéo téléchargée", flush=True)
+
+        # Étape 3 : Découpe des clips avec ffmpeg
+        for i, clip in enumerate(clips):
+            ts_start = clip.get("ts_start", "00:00")
+            ts_end = clip.get("ts_end", "00:30")
+            start_sec = ts_to_seconds(ts_start)
+            end_sec = ts_to_seconds(ts_end)
+            duration = end_sec - start_sec
+            if duration <= 0:
+                duration = body.target_duration
+
+            clip_path = f"{video_dir}/clip_{i+1}.mp4"
+            print(f"CUT: Clip {i+1} de {ts_start} à {ts_end}", flush=True)
+            result = subprocess.run([
+                "ffmpeg", "-i", video_path,
+                "-ss", str(start_sec),
+                "-t", str(duration),
+                "-c:v", "libx264", "-c:a", "aac",
+                "-preset", "fast",
+                "-y", clip_path
+            ], capture_output=True, text=True)
+
+            if result.returncode == 0:
+                clip["clip_file"] = f"/api/clips/{video_id}/{i+1}"
+                print(f"CUT: Clip {i+1} OK", flush=True)
+            else:
+                print(f"CUT ERROR clip {i+1}: {result.stderr[-200:]}", flush=True)
+
+        # Supprimer la vidéo complète pour libérer de l'espace
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
         db = get_db()
         db.execute("UPDATE videos SET status='analyzed', clips_json=? WHERE id=?",
@@ -148,12 +207,28 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
             (len(clips), user_id))
         db.commit()
         db.close()
+        print(f"ANALYSE SUCCESS: {len(clips)} clips prêts", flush=True)
+
     except Exception as e:
         print(f"ANALYSE ERROR: {type(e).__name__}: {e}", flush=True)
+        if os.path.exists(video_dir):
+            shutil.rmtree(video_dir, ignore_errors=True)
         db = get_db()
         db.execute("UPDATE videos SET status='failed' WHERE id=?", (video_id,))
         db.commit()
         db.close()
+
+# ── DOWNLOAD CLIPS ────────────────────────────────────────
+@app.get("/api/clips/{video_id}/{clip_index}")
+def download_clip(video_id: str, clip_index: int, user=Depends(get_current_user)):
+    clip_path = f"{CLIPS_DIR}/{video_id}/clip_{clip_index}.mp4"
+    if not os.path.exists(clip_path):
+        raise HTTPException(status_code=404, detail="Clip non trouvé ou expiré")
+    return FileResponse(
+        clip_path,
+        media_type="video/mp4",
+        filename=f"skynet_clip_{clip_index}.mp4"
+    )
 
 @app.get("/api/videos/{video_id}/status")
 def video_status(video_id: str, user=Depends(get_current_user)):
@@ -171,11 +246,10 @@ def video_status(video_id: str, user=Depends(get_current_user)):
 def analytics(user=Depends(get_current_user)):
     db = get_db()
     u = dict(db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())
-    total_videos = db.execute("SELECT COUNT(*) FROM videos WHERE user_id=?", (user["id"],)).fetchone()[0]
     db.close()
     return {"clips_generated": u["clips_used"], "total_views": u["clips_used"] * 45000,
             "subscribers_gained": u["clips_used"] * 159, "engagement_rate": 6.8}
 
 @app.get("/")
 def root():
-    return {"status": "SKYnet API en ligne", "version": "1.0"}
+    return {"status": "SKYnet API en ligne", "version": "2.0"}
