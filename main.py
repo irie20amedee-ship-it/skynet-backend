@@ -190,25 +190,21 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
 
 # ── SOUS-TITRES STYLE TIKTOK ──────────────────────────────
 def add_subtitles(clip_path):
+    import traceback
     try:
         from faster_whisper import WhisperModel
 
         print(f"SUBTITLE: Transcription de {clip_path}", flush=True)
         model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(clip_path, word_timestamps=True)
 
-        all_words = []
-        for seg in segments:
-            if seg.words:
-                all_words.extend(seg.words)
+        # word_timestamps=False : plus stable, évite les IndexError internes
+        segments_gen, _ = model.transcribe(clip_path, word_timestamps=False)
+        segment_list = list(segments_gen)  # consomme le générateur complètement
 
-        if not all_words:
-            print("SUBTITLE: Aucun mot détecté", flush=True)
+        if not segment_list:
+            print("SUBTITLE: Aucun segment détecté", flush=True)
             return
 
-        print(f"SUBTITLE: {len(all_words)} mots transcrits", flush=True)
-
-        # Génère le fichier SRT (ne nécessite pas libass, supporté nativement)
         def t2srt(t):
             h = int(t // 3600)
             m = int((t % 3600) // 60)
@@ -218,13 +214,30 @@ def add_subtitles(clip_path):
 
         srt_lines = []
         idx = 1
-        for i in range(0, len(all_words), 3):
-            chunk = all_words[i:i+3]
-            start = chunk[0].start
-            end = chunk[-1].end
-            text = " ".join(w.word.strip() for w in chunk).upper()
-            srt_lines.append(f"{idx}\n{t2srt(start)} --> {t2srt(end)}\n{text}\n")
-            idx += 1
+        for seg in segment_list:
+            text = seg.text.strip()
+            if not text:
+                continue
+            words = text.split()
+            seg_dur = max(seg.end - seg.start, 0.5)
+            words_per_chunk = 3
+            n_chunks = max(1, (len(words) + words_per_chunk - 1) // words_per_chunk)
+            chunk_dur = seg_dur / n_chunks
+
+            for i in range(0, len(words), words_per_chunk):
+                chunk_words = words[i:i+words_per_chunk]
+                chunk_idx = i // words_per_chunk
+                t_start = seg.start + chunk_idx * chunk_dur
+                t_end = t_start + chunk_dur
+                line_text = " ".join(chunk_words).upper()
+                srt_lines.append(f"{idx}\n{t2srt(t_start)} --> {t2srt(t_end)}\n{line_text}\n")
+                idx += 1
+
+        if not srt_lines:
+            print("SUBTITLE: Aucun texte transcrit", flush=True)
+            return
+
+        print(f"SUBTITLE: {idx-1} lignes générées", flush=True)
 
         srt_content = "\n".join(srt_lines)
         fd, srt_path = tempfile.mkstemp(suffix=".srt")
@@ -233,7 +246,6 @@ def add_subtitles(clip_path):
 
         tmp_out = clip_path.replace(".mp4", "_sub.mp4")
 
-        # Style TikTok via force_style: gros, blanc, contour noir, centré en bas
         style = (
             "Fontname=DejaVu Sans Bold,"
             "Fontsize=24,"
@@ -266,6 +278,7 @@ def add_subtitles(clip_path):
 
     except Exception as e:
         print(f"SUBTITLE ERROR: {type(e).__name__}: {e}", flush=True)
+        print(f"SUBTITLE TRACEBACK: {traceback.format_exc()}", flush=True)
 
 # ── UPLOAD ET DÉCOUPE ─────────────────────────────────────
 @app.post("/api/videos/{video_id}/upload")
