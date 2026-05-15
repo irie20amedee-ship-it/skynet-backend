@@ -189,6 +189,23 @@ Génère exactement {body.nb_clips} clips viraux en JSON pur (sans texte autour)
         db.close()
 
 # ── SOUS-TITRES STYLE TIKTOK ──────────────────────────────
+def find_font():
+    import glob
+    candidates = [
+        "/nix/store/*/share/fonts/**/*Bold*.ttf",
+        "/nix/store/*/share/fonts/**/*.ttf",
+        "/usr/share/fonts/**/*Bold*.ttf",
+        "/usr/share/fonts/**/*.ttf",
+    ]
+    for pattern in candidates:
+        matches = glob.glob(pattern, recursive=True)
+        for m in matches:
+            if "DejaVu" in m and "Bold" in m:
+                return m
+        if matches:
+            return matches[0]
+    return None
+
 def add_subtitles(clip_path):
     import traceback
     try:
@@ -196,81 +213,76 @@ def add_subtitles(clip_path):
 
         print(f"SUBTITLE: Transcription de {clip_path}", flush=True)
         model = WhisperModel("tiny", device="cpu", compute_type="int8")
-
-        # word_timestamps=False : plus stable, évite les IndexError internes
         segments_gen, _ = model.transcribe(clip_path, word_timestamps=False)
-        segment_list = list(segments_gen)  # consomme le générateur complètement
+        segment_list = list(segments_gen)
 
         if not segment_list:
             print("SUBTITLE: Aucun segment détecté", flush=True)
             return
 
-        def t2srt(t):
-            h = int(t // 3600)
-            m = int((t % 3600) // 60)
-            s = int(t % 60)
-            ms = int((t % 1) * 1000)
-            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-        srt_lines = []
-        idx = 1
+        # Construit les entrées (t_start, t_end, texte)
+        entries = []
         for seg in segment_list:
             text = seg.text.strip()
             if not text:
                 continue
             words = text.split()
             seg_dur = max(seg.end - seg.start, 0.5)
-            words_per_chunk = 3
-            n_chunks = max(1, (len(words) + words_per_chunk - 1) // words_per_chunk)
+            n_chunks = max(1, (len(words) + 2) // 3)
             chunk_dur = seg_dur / n_chunks
-
-            for i in range(0, len(words), words_per_chunk):
-                chunk_words = words[i:i+words_per_chunk]
-                chunk_idx = i // words_per_chunk
-                t_start = seg.start + chunk_idx * chunk_dur
+            for i in range(0, len(words), 3):
+                ci = i // 3
+                t_start = seg.start + ci * chunk_dur
                 t_end = t_start + chunk_dur
-                line_text = " ".join(chunk_words).upper()
-                srt_lines.append(f"{idx}\n{t2srt(t_start)} --> {t2srt(t_end)}\n{line_text}\n")
-                idx += 1
+                entries.append((t_start, t_end, " ".join(words[i:i+3]).upper()))
 
-        if not srt_lines:
+        if not entries:
             print("SUBTITLE: Aucun texte transcrit", flush=True)
             return
 
-        print(f"SUBTITLE: {idx-1} lignes générées", flush=True)
+        print(f"SUBTITLE: {len(entries)} lignes générées", flush=True)
 
-        srt_content = "\n".join(srt_lines)
-        fd, srt_path = tempfile.mkstemp(suffix=".srt")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(srt_content)
+        # Cherche une police disponible sur le système
+        font_path = find_font()
+        print(f"SUBTITLE: Police = {font_path}", flush=True)
+
+        # drawtext : ne nécessite pas libass, fonctionne avec tout ffmpeg
+        filter_parts = []
+        for t_start, t_end, text in entries:
+            safe = (text
+                .replace("\\", "\\\\")
+                .replace("'",  "\\'")
+                .replace(":",  "\\:")
+                .replace(",",  "\\,")
+                .replace("[",  "\\[")
+                .replace("]",  "\\]")
+                .replace("%",  "\\%")
+            )
+            fontfile = f":fontfile='{font_path}'" if font_path else ""
+            filter_parts.append(
+                f"drawtext=text='{safe}'"
+                f"{fontfile}"
+                f":enable='between(t,{t_start:.3f},{t_end:.3f})'"
+                f":fontsize=55"
+                f":fontcolor=white"
+                f":borderw=4"
+                f":bordercolor=black"
+                f":x=(w-text_w)/2"
+                f":y=h-th-80"
+            )
 
         tmp_out = clip_path.replace(".mp4", "_sub.mp4")
-
-        style = (
-            "Fontname=DejaVu Sans Bold,"
-            "Fontsize=24,"
-            "PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,"
-            "BorderStyle=1,"
-            "Outline=3,"
-            "Bold=1,"
-            "Alignment=2,"
-            "MarginV=60"
-        )
-
         result = subprocess.run([
             FFMPEG_EXE, "-i", clip_path,
-            "-vf", f"subtitles={srt_path}:force_style='{style}'",
+            "-vf", ",".join(filter_parts),
             "-c:a", "copy",
             "-preset", "fast",
             "-y", tmp_out
         ], capture_output=True, text=True)
 
-        os.unlink(srt_path)
-
         if result.returncode == 0 and os.path.exists(tmp_out):
             os.replace(tmp_out, clip_path)
-            print(f"SUBTITLE: OK — sous-titres brûlés dans le clip", flush=True)
+            print(f"SUBTITLE: OK — sous-titres brûlés", flush=True)
         else:
             print(f"SUBTITLE ERROR ffmpeg (code {result.returncode}): {result.stderr[-500:]}", flush=True)
             if os.path.exists(tmp_out):
